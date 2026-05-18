@@ -121,11 +121,12 @@ jobs:
           CARGO_TERM_COLOR: always
         run: |
           set -eo pipefail
-          # Native arm64 host: `napi build --platform --release` (the repo's
-          # `yarn build`) auto-detects host triple aarch64-pc-windows-msvc and
-          # emits tokenizers.win32-arm64-msvc.node at project root. Do NOT pass
-          # --target on a native host (avoids cross-detection linker prefix).
-          yarn build 2> ../napi-stderr.log \
+          # Pass --target explicitly. On the windows-11-arm runner, if node/
+          # yarn/rust were ever x64-under-emulation, host auto-detection would
+          # silently produce an x64 .node; an explicit target goes straight to
+          # Cargo and pins aarch64-pc-windows-msvc. (The PE-0xAA64 gate below is
+          # the backstop.) Use the repo's own pinned @napi-rs/cli via yarn exec.
+          yarn exec napi build --platform --release --target aarch64-pc-windows-msvc 2> ../napi-stderr.log \
             || { echo "NAPI BUILD FAILED:"; tail -120 ../napi-stderr.log; exit 1; }
           ls -la *.node || true
 

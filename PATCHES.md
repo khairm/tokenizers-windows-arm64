@@ -17,13 +17,13 @@
 3. **Install:** upstream uses **yarn berry** (`packageManager: yarn@3.x`,
    `.yarnrc.yml`). `corepack enable` then `yarn install --immutable` (falls
    back to a plain `yarn install`).
-4. **Build:** `yarn build` (= `napi build --platform --release`, using the
-   repo's own pinned `@napi-rs/cli` ^2.x).
-   - **Do NOT pass `--target`.** The runner host *is*
-     `aarch64-pc-windows-msvc`; a native host build with `--platform` emits
-     `tokenizers.win32-arm64-msvc.node` at project root. Passing `--target` on
-     a native host can trigger napi-rs cross-compile detection that inserts a
-     linker prefix and breaks the link.
+4. **Build:** `yarn exec napi build --platform --release --target
+   aarch64-pc-windows-msvc` (the repo's own pinned `@napi-rs/cli` ^2.x).
+   - **Pass `--target` explicitly.** Although the runner host *is*
+     `aarch64-pc-windows-msvc`, if node/yarn/rust were ever x64-under-emulation
+     on the runner, host auto-detection would silently emit an **x64** `.node`.
+     `napi build --target` passes the triple straight to Cargo, pinning ARM64.
+     The PE-machine `0xAA64` gate in the package step is the backstop.
 5. **Package:** copy `tokenizers.win32-arm64-msvc.node`; emit a `package.json`
    mirroring the published `@anush008/tokenizers-win32-x64-msvc` but with
    `cpu:["arm64"]` and the arm64 `main`. Prove it loads under Node
