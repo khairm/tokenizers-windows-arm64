@@ -1,0 +1,201 @@
+name: Nightly tokenizers Windows ARM64 Build
+
+# Builds Anush008/tokenizers (HuggingFace tokenizers napi-rs binding) for
+# aarch64-pc-windows-msvc and publishes a per-version
+# `@anush008/tokenizers-win32-arm64-msvc` Release (the platform package the
+# upstream author does not publish). Consumed by khairm/superset-windows-arm64.
+#
+# Change-gated: the nightly only builds when the tokenizers version it would
+# build is not already released here. workflow_dispatch can build a specific
+# version on demand.
+#
+# Deterministic: no source patch is required. We build upstream tokenizers
+# unmodified with its own pinned @napi-rs/cli. napi-rs addons are N-API
+# (ABI-stable across Node/Electron versions), so ONE arm64 build works for any
+# Electron — no per-ABI variants needed (unlike V8-ABI modules). See PATCHES.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tokenizers_version:
+        description: "@anush008/tokenizers version to build (blank = latest on npm)"
+        default: ""
+  schedule:
+    - cron: "45 0 * * *" # 00:45 UTC daily (after libsql/superset cadence)
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.c.outputs.should_build }}
+      version: ${{ steps.c.outputs.version }}
+    steps:
+      - name: Decide version + change-gate
+        id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REQ="${{ github.event.inputs.tokenizers_version }}"
+          if [ -n "$REQ" ]; then
+            V="$REQ"
+          else
+            V="$(npm view @anush008/tokenizers version)"
+          fi
+          [ -n "$V" ] || { echo "could not determine tokenizers version"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "$V" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "tokenizers $V already released here — skip"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tokenizers $V not yet built — build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: windows-11-arm
+    steps:
+      - name: Checkout patches repo
+        uses: actions/checkout@v5
+
+      - name: Setup Node + corepack (yarn berry)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Ensure Rust (no upstream toolchain pin -> stable)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+            ./rustup-init.exe -y --default-toolchain stable --profile minimal
+            Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+          } else {
+            rustup default stable
+          }
+
+      - name: Clone tokenizers @ version
+        shell: bash
+        run: |
+          V="${{ needs.check.outputs.version }}"
+          echo "Building @anush008/tokenizers v$V"
+          git clone --depth 1 --branch "v$V" https://github.com/Anush008/tokenizers.git tokenizers
+
+      - name: Rust toolchain + target
+        working-directory: tokenizers
+        shell: bash
+        run: |
+          rustup show
+          # Host on windows-11-arm IS aarch64-pc-windows-msvc; add target defensively.
+          rustup target add aarch64-pc-windows-msvc || true
+          rustc -vV
+
+      - name: Locate libclang (defensive — some HF tokenizers deps may bindgen)
+        shell: pwsh
+        run: |
+          $c = Get-ChildItem -Path 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $c) { $c = Get-ChildItem -Path 'C:\Program Files\LLVM' -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if ($c) { Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$($c.DirectoryName)"; Write-Host "LIBCLANG_PATH=$($c.DirectoryName)" }
+          else { Write-Host "::warning::libclang.dll not found; only matters if a dep uses bindgen" }
+
+      - name: Yarn install (upstream uses yarn berry)
+        working-directory: tokenizers
+        shell: bash
+        run: |
+          set -eo pipefail
+          corepack enable
+          # Honour the repo's packageManager pin; fall back to a plain install.
+          yarn install --immutable 2> ../yarn-stderr.log \
+            || yarn install 2>> ../yarn-stderr.log \
+            || { echo "YARN INSTALL FAILED:"; tail -80 ../yarn-stderr.log; exit 1; }
+
+      - name: napi build (release, native aarch64 host)
+        working-directory: tokenizers
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          set -eo pipefail
+          # Native arm64 host: `napi build --platform --release` (the repo's
+          # `yarn build`) auto-detects host triple aarch64-pc-windows-msvc and
+          # emits tokenizers.win32-arm64-msvc.node at project root. Do NOT pass
+          # --target on a native host (avoids cross-detection linker prefix).
+          yarn build 2> ../napi-stderr.log \
+            || { echo "NAPI BUILD FAILED:"; tail -120 ../napi-stderr.log; exit 1; }
+          ls -la *.node || true
+
+      - name: Package + verify @anush008/tokenizers-win32-arm64-msvc
+        working-directory: tokenizers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $V = "${{ needs.check.outputs.version }}"
+          $node = 'tokenizers.win32-arm64-msvc.node'
+          if (-not (Test-Path $node)) {
+            $cand = Get-ChildItem '*.node' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $cand) { Write-Error "no .node produced"; exit 1 }
+            $node = $cand.Name
+            Copy-Item $node 'tokenizers.win32-arm64-msvc.node' -Force
+            $node = 'tokenizers.win32-arm64-msvc.node'
+          }
+          $fs=[IO.File]::OpenRead($node);$br=New-Object IO.BinaryReader($fs);$fs.Position=0x3C;$pe=$br.ReadInt32();$fs.Position=$pe+4;$m=$br.ReadUInt16();$br.Close()
+          if ($m -ne 0xAA64) { Write-Error "addon not ARM64 (0x$('{0:X}' -f $m))"; exit 1 }
+          $stage = "$env:GITHUB_WORKSPACE\stage"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $node "$stage\tokenizers.win32-arm64-msvc.node" -Force
+          @"
+          {
+            "name": "@anush008/tokenizers-win32-arm64-msvc",
+            "version": "$V",
+            "os": ["win32"],
+            "cpu": ["arm64"],
+            "main": "tokenizers.win32-arm64-msvc.node",
+            "files": ["tokenizers.win32-arm64-msvc.node"],
+            "description": "Multi-arch builds of HuggingFace tokenizers",
+            "license": "MIT",
+            "engines": { "node": ">= 10" },
+            "repository": "https://github.com/Anush008/tokenizers"
+          }
+          "@ | Set-Content "$stage\package.json"
+          # Definitive proof it is a loadable ARM64 N-API addon (N-API is
+          # ABI-stable, so loading under runner Node 20 proves it for Electron).
+          node -e "require(process.argv[1]); console.log('ADDON LOADED OK')" "$stage\tokenizers.win32-arm64-msvc.node"
+          if ($LASTEXITCODE -ne 0) { Write-Error "addon failed to load"; exit 1 }
+          Get-ChildItem $stage
+
+      - name: Archive + checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf tokenizers-win32-arm64-msvc.tar.gz -C stage .
+          sha256sum tokenizers-win32-arm64-msvc.tar.gz > tokenizers-win32-arm64-msvc.tar.gz.sha256
+          cat tokenizers-win32-arm64-msvc.tar.gz.sha256
+
+      - name: Publish per-version Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ needs.check.outputs.version }}"
+          gh release delete "$V" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          git push --delete origin "refs/tags/$V" 2>/dev/null || true
+          gh release create "$V" \
+            tokenizers-win32-arm64-msvc.tar.gz \
+            tokenizers-win32-arm64-msvc.tar.gz.sha256 \
+            --repo "${{ github.repository }}" \
+            --title "tokenizers $V — @anush008/tokenizers-win32-arm64-msvc" \
+            --notes "Native Windows ARM64 build of [Anush008/tokenizers](https://github.com/Anush008/tokenizers) \`v$V\` (the \`@anush008/tokenizers-win32-arm64-msvc\` platform package upstream does not publish).
+
+          Tag = the tokenizers version. Consumed by [superset-windows-arm64](https://github.com/khairm/superset-windows-arm64).
+
+          **Assets:**
+          - \`tokenizers-win32-arm64-msvc.tar.gz\` — extract to get \`tokenizers.win32-arm64-msvc.node\` + \`package.json\` (drop in as \`@anush008/tokenizers-win32-arm64-msvc\`)
+          - \`tokenizers-win32-arm64-msvc.tar.gz.sha256\`
+
+          Built deterministically (no upstream source patch; N-API addon, ABI-stable). Not affiliated with the upstream author."
