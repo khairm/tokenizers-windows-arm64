@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       tokenizers_version:
-        description: "@anush008/tokenizers version to build (blank = latest on npm)"
+        description: "@anush008/tokenizers version to build (blank = the version fastembed pins)"
         default: ""
   schedule:
     - cron: "45 0 * * *" # 00:45 UTC daily (after libsql/superset cadence)
@@ -43,7 +43,20 @@ jobs:
           if [ -n "$REQ" ]; then
             V="$REQ"
           else
-            V="$(npm view @anush008/tokenizers version)"
+            # Default = the @anush008/tokenizers version the CONSUMER needs, not
+            # npm-latest. fastembed (used by Superset) pins it; e.g. fastembed
+            # 2.1.0 -> "^0.0.0", which semver-resolves to exactly 0.0.0. Resolve
+            # fastembed's range to a concrete published version so the nightly
+            # keeps the version Superset actually builds against fresh, and
+            # auto-tracks a future fastembed bump.
+            RANGE="$(npm view fastembed dependencies --json 2>/dev/null \
+                     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log((JSON.parse(s)||{})["@anush008/tokenizers"]||"")}catch{console.log("")}})')"
+            if [ -n "$RANGE" ]; then
+              V="$(npm view "@anush008/tokenizers@$RANGE" version 2>/dev/null | sed 's/.*'\''\(.*\)'\''.*/\1/' | tail -1)"
+              echo "fastembed pins @anush008/tokenizers '$RANGE' -> $V"
+            fi
+            # Fallback: if fastembed resolution failed, build npm-latest.
+            [ -n "${V:-}" ] || V="$(npm view @anush008/tokenizers version)"
           fi
           [ -n "$V" ] || { echo "could not determine tokenizers version"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"

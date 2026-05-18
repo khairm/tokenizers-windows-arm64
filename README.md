@@ -11,10 +11,11 @@ Consumed by [`superset-windows-arm64`](https://github.com/khairm/superset-window
 ## How it works
 
 1. A GitHub Actions workflow runs nightly (also `workflow_dispatch`).
-2. **Change-gated:** it determines the target version (latest of
-   `@anush008/tokenizers` on npm, or a `workflow_dispatch` input) and **only
-   builds if that version is not already released here** — no rebuilds when
-   nothing changed.
+2. **Change-gated:** it determines the target version — by default the
+   `@anush008/tokenizers` version `fastembed` pins (the consumer that matters;
+   e.g. `fastembed@2.1.0` → `^0.0.0` → `0.0.0`), or an explicit
+   `workflow_dispatch` input — and **only builds if that version is not already
+   released here** — no rebuilds when nothing changed.
 3. On a native `windows-11-arm` runner it builds upstream `tokenizers`
    **unmodified** with its own pinned `@napi-rs/cli` for the native host triple
    `aarch64-pc-windows-msvc` (Rust stable + VS 2022) — see [`PATCHES.md`](PATCHES.md).
